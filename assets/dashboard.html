@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FiveM Live Monitor</title>
+<script src="chart.js"></script>
+<style>
+  .viz-root{
+    color-scheme: light;
+    --page:#f9f9f7; --surface-1:#fcfcfb;
+    --text-primary:#0b0b0b; --text-secondary:#52514e; --muted:#898781;
+    --grid:#e1e0d9; --baseline:#c3c2b7; --border:rgba(11,11,11,0.10);
+    --s-blue:#2a78d6; --s-green:#008300; --s-violet:#4a3aa7; --s-orange:#eb6834; --s-red:#e34948;
+    --st-good:#0ca30c; --st-warning:#fab219; --st-critical:#d03b3b;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:where(:not([data-theme="light"])) .viz-root{
+      color-scheme: dark;
+      --page:#0d0d0d; --surface-1:#1a1a19;
+      --text-primary:#ffffff; --text-secondary:#c3c2b7; --muted:#898781;
+      --grid:#2c2c2a; --baseline:#383835; --border:rgba(255,255,255,0.10);
+      --s-blue:#3987e5; --s-green:#008300; --s-violet:#9085e9; --s-orange:#d95926; --s-red:#e66767;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
+  .viz-root{background:var(--page);color:var(--text-primary);min-height:100vh;padding:20px}
+  .wrap{max-width:1100px;margin:0 auto}
+  h1{font-size:18px;margin:0}
+  .sub{color:var(--text-secondary);font-size:12px;margin:2px 0 16px}
+  .dot{display:inline-block;width:9px;height:9px;border-radius:99px;background:var(--st-good);margin-right:6px}
+  .dot.stale{background:var(--st-critical)}
+  .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:14px}
+  .tile{background:var(--surface-1);border:1px solid var(--border);border-radius:10px;padding:12px 14px}
+  .tile .v{font-size:24px;font-weight:600;line-height:1.1}
+  .tile .l{font-size:11px;color:var(--text-secondary);margin-top:4px}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media (max-width:900px){.grid2{grid-template-columns:1fr}}
+  .card{background:var(--surface-1);border:1px solid var(--border);border-radius:10px;padding:12px 14px;margin-bottom:14px}
+  .card h2{font-size:13px;margin:0 0 8px;color:var(--text-primary)}
+  .chart-box{position:relative;height:160px}
+  table{width:100%;border-collapse:collapse;font-size:12px}
+  th{text-align:left;color:var(--muted);font-weight:500;padding:4px 6px;border-bottom:1px solid var(--baseline)}
+  td{padding:4px 6px;border-bottom:1px solid var(--grid);color:var(--text-secondary);vertical-align:top}
+  td.cause{color:var(--text-primary);font-weight:600;white-space:nowrap}
+  .mono{font-variant-numeric:tabular-nums;white-space:nowrap}
+  .pill{display:inline-block;padding:0 7px;border-radius:99px;font-size:10px;font-weight:700;color:#fff}
+  .sev-crit{background:var(--st-critical)} .sev-warn{background:var(--st-warning);color:#0b0b0b}
+  .sev-info{background:var(--muted)}
+  .muted{color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="viz-root"><div class="wrap">
+  <h1><span id="dot" class="dot"></span>FiveM Live Monitor</h1>
+  <div class="sub">updated <span id="upd" class="mono">-</span> &middot; refreshes every 5s &middot; last 30 min shown</div>
+
+  <div class="tiles">
+    <div class="tile"><div class="v" id="tPlayers">-</div><div class="l">Players</div></div>
+    <div class="tile"><div class="v" id="tHttp">-</div><div class="l">players.json ms</div></div>
+    <div class="tile"><div class="v" id="tCore">-</div><div class="l">Max core %</div></div>
+    <div class="tile"><div class="v" id="tFxCpu">-</div><div class="l">FXServer CPU %</div></div>
+    <div class="tile"><div class="v" id="tRam">-</div><div class="l">RAM free MB</div></div>
+    <div class="tile"><div class="v" id="tUdp">-</div><div class="l">UDP in pps</div></div>
+    <div class="tile"><div class="v" id="tPing">-</div><div class="l">Ping ext ms</div></div>
+  </div>
+
+  <div class="grid2">
+    <div class="card"><h2>Players</h2><div class="chart-box"><canvas id="cPlayers"></canvas></div></div>
+    <div class="card"><h2>CPU % (max core / total / FXServer)</h2><div class="chart-box"><canvas id="cCpu"></canvas></div></div>
+    <div class="card"><h2>UDP in pps (+ no-port)</h2><div class="chart-box"><canvas id="cUdp"></canvas></div></div>
+    <div class="card"><h2>Ping ms (1.1.1.1 / 8.8.8.8)</h2><div class="chart-box"><canvas id="cPing"></canvas></div></div>
+  </div>
+
+  <div class="card"><h2>Recent alerts</h2>
+    <table><thead><tr><th>Time</th><th>Sev</th><th>Cause</th><th>Detail</th></tr></thead>
+    <tbody id="alerts"><tr><td colspan="4" class="muted">none yet</td></tr></tbody></table>
+  </div>
+</div></div>
+<script>
+function cssVar(n){ return getComputedStyle(document.querySelector('.viz-root')).getPropertyValue(n).trim(); }
+function esc(s){ const d=document.createElement('div'); d.textContent=(s==null?'':String(s)); return d.innerHTML; }
+let charts = {};
+function mk(id, series){
+  const muted = cssVar('--muted'), grid = cssVar('--grid');
+  Chart.defaults.font.family = 'system-ui,-apple-system,"Segoe UI",sans-serif';
+  Chart.defaults.color = muted;
+  charts[id] = new Chart(document.getElementById(id), {
+    type:'line',
+    data:{ labels:[], datasets: series.map(s => ({ label:s.label, data:[],
+      borderColor:cssVar(s.color), backgroundColor:cssVar(s.color),
+      borderWidth:2, pointRadius:0, pointHitRadius:8, tension:0, spanGaps:false })) },
+    options:{ responsive:true, maintainAspectRatio:false, animation:false,
+      interaction:{mode:'index',intersect:false},
+      plugins:{ legend:{display:series.length>1,labels:{boxWidth:9,boxHeight:9,color:cssVar('--text-secondary')}} },
+      scales:{ x:{ticks:{maxTicksLimit:6,color:muted},grid:{display:false}},
+               y:{beginAtZero:true,ticks:{maxTicksLimit:5,color:muted},grid:{color:grid,drawTicks:false}} } }
+  });
+}
+function initCharts(){
+  if (!window.Chart || charts.cPlayers) return;
+  mk('cPlayers',[{label:'Players',data:null,color:'--s-blue'}]);
+  mk('cCpu',[{label:'Max core',color:'--s-red'},{label:'Total',color:'--s-blue'},{label:'FXServer',color:'--s-green'}]);
+  mk('cUdp',[{label:'UDP in',color:'--s-blue'},{label:'no-port',color:'--s-red'}]);
+  mk('cPing',[{label:'1.1.1.1',color:'--s-blue'},{label:'8.8.8.8',color:'--s-violet'}]);
+}
+initCharts();
+if (!window.Chart){
+  // local chart.js missing - try the CDN as a last resort
+  var s = document.createElement('script');
+  s.src = 'https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js';
+  s.onload = initCharts;
+  document.head.appendChild(s);
+}
+function setChart(id, labels, seriesData){
+  const c = charts[id]; if (!c) return;
+  c.data.labels = labels;
+  seriesData.forEach((d,i)=>{ c.data.datasets[i].data = d; });
+  c.update('none');
+}
+function nn(v){ return (v==null || v<0) ? null : v; }
+let lastOk = 0;
+async function tick(){
+  try{
+    const r = await fetch('data', {cache:'no-store'});
+    const d = await r.json();
+    lastOk = Date.now();
+    initCharts();
+    const now = d.now || {};
+    const set=(id,v,suf)=>{ document.getElementById(id).textContent = (v==null||v<0)?'-':(v+(suf||'')); };
+    set('tPlayers', now.players); set('tHttp', now.httpMs); set('tCore', now.cpuMax);
+    set('tFxCpu', now.fxCpu); set('tRam', now.ramAvail); set('tUdp', now.udpIn); set('tPing', now.pingExt);
+    document.getElementById('upd').textContent = now.ts || '-';
+    const h = d.hist || [];
+    const L = h.map(x=>x.t);
+    setChart('cPlayers', L, [h.map(x=>nn(x.p))]);
+    setChart('cCpu', L, [h.map(x=>nn(x.cm)), h.map(x=>nn(x.ct)), h.map(x=>nn(x.fc))]);
+    setChart('cUdp', L, [h.map(x=>nn(x.ui)), h.map(x=>nn(x.un))]);
+    setChart('cPing', L, [h.map(x=>nn(x.p1)), h.map(x=>nn(x.p2))]);
+    const al = d.alerts || [];
+    document.getElementById('alerts').innerHTML = al.length === 0
+      ? '<tr><td colspan="4" class="muted">none yet</td></tr>'
+      : al.map(a=>{
+          const cls = a.severity==='CRIT'?'sev-crit':(a.severity==='INFO'?'sev-info':'sev-warn');
+          return '<tr><td class="mono">'+esc(a.ts)+'</td><td><span class="pill '+cls+'">'+esc(a.severity)+'</span></td>'+
+                 '<td class="cause">'+esc(a.cause)+'</td><td>'+esc(a.detail)+'</td></tr>';
+        }).join('');
+  }catch(e){}
+  document.getElementById('dot').className = 'dot' + ((Date.now()-lastOk) > 20000 ? ' stale' : '');
+}
+setInterval(tick, 5000); tick();
+</script>
+</body>
+</html>

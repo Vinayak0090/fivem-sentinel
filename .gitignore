@@ -1,0 +1,13 @@
+# runtime output
+logs/
+reports/
+*.log
+
+# local scratch
+_test_render/
+node_modules/
+__pycache__/
+*.pyc
+
+# archives
+*.zip

@@ -77,6 +77,48 @@ param(
 # ------------------------------------------------------------------ setup
 $ErrorActionPreference = 'Continue'
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$bound = $PSBoundParameters
+
+# ---------------------------------------------------- optional config file
+# sentinel.conf (KEY=VALUE, # comments) next to this script or in the repo
+# root. Explicit command-line parameters win over the file. The profiler
+# settings only live here - see sentinel.conf.example.
+$ProfilerEnabled = $false; $ProfilerFrames = 200; $ProfilerCooldownSec = 600
+$ProfilerTriggers = 'SCRIPT_HITCH,SERVER_THREAD_SLOW,CPU_CORE_SATURATED,MASS_PLAYER_DROP'
+$RconPassword = ''; $RconPort = 0
+$confPath = @((Join-Path $scriptRoot 'sentinel.conf'),
+              (Join-Path (Split-Path -Parent $scriptRoot) 'sentinel.conf')) |
+    Where-Object { Test-Path $_ } | Select-Object -First 1
+if ($confPath) {
+    $conf = @{}
+    foreach ($ln in (Get-Content $confPath)) {
+        $t = $ln.Trim()
+        if ($t -eq '' -or $t.StartsWith('#')) { continue }
+        $kv = $t -split '=', 2
+        if ($kv.Count -ne 2) { continue }
+        $conf[$kv[0].Trim().ToUpper()] = $kv[1].Trim().Trim('"')
+    }
+    if ($conf['SERVER_PORT']   -and -not $bound.ContainsKey('ServerPort'))     { $ServerPort  = [int]$conf['SERVER_PORT'] }
+    if ($conf['INTERVAL']      -and -not $bound.ContainsKey('IntervalSec'))    { $IntervalSec = [int]$conf['INTERVAL'] }
+    if ($conf['CONSOLE_LOG']   -and -not $bound.ContainsKey('ConsoleLogPath')) { $ConsoleLogPath = $conf['CONSOLE_LOG'] }
+    if (($conf['EXT1'] -or $conf['EXT2']) -and -not $bound.ContainsKey('ExternalPingTargets')) {
+        $ExternalPingTargets = @(@($conf['EXT1'], $conf['EXT2']) | Where-Object { $_ })
+    }
+    if ($conf['DISCORD_WEBHOOK'] -and -not $bound.ContainsKey('DiscordWebhook')) { $DiscordWebhook = $conf['DISCORD_WEBHOOK'] }
+    if ($conf['CFX_JOIN_CODE']  -and -not $bound.ContainsKey('CfxJoinCode'))    { $CfxJoinCode = $conf['CFX_JOIN_CODE'] }
+    if ($conf['DASHBOARD_PORT'] -and -not $bound.ContainsKey('DashboardPort'))  { $DashboardPort = [int]$conf['DASHBOARD_PORT'] }
+    if ($conf['DASHBOARD_BIND'] -and -not $bound.ContainsKey('DashboardBind'))  { $DashboardBind = $conf['DASHBOARD_BIND'] }
+    if ($conf['PROFILER_ENABLED'])  { $ProfilerEnabled = ($conf['PROFILER_ENABLED'] -match '^(true|1|yes|on)$') }
+    if ($conf['PROFILER_FRAMES'])   { $ProfilerFrames = [int]$conf['PROFILER_FRAMES'] }
+    if ($conf['PROFILER_TRIGGERS']) { $ProfilerTriggers = $conf['PROFILER_TRIGGERS'] }
+    if ($conf['PROFILER_COOLDOWN']) { $ProfilerCooldownSec = [int]$conf['PROFILER_COOLDOWN'] }
+    if ($conf['RCON_PASSWORD'])     { $RconPassword = $conf['RCON_PASSWORD'] }
+    if ($conf['RCON_PORT'])         { $RconPort = [int]$conf['RCON_PORT'] }
+}
+if ($RconPort -eq 0) { $RconPort = $ServerPort }
+$ProfilerTriggerSet = @($ProfilerTriggers -split ',' | ForEach-Object { $_.Trim().ToUpper() } | Where-Object { $_ })
+$ProfilerActive = [bool]($ProfilerEnabled -and $RconPassword)
+
 if (-not $LogDir) { $LogDir = Join-Path $scriptRoot 'logs' }
 New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 
@@ -196,6 +238,21 @@ function Ping-Ms([string]$target) {
     } catch {}
     return -1   # -1 == lost / failed
 }
+
+# -------------------------------------------------- rcon / auto-profiler
+# Fire-and-forget console command over FiveM's rcon (UDP, Quake-style OOB).
+function Send-Rcon([string]$cmd) {
+    try {
+        $udp = New-Object System.Net.Sockets.UdpClient
+        $bytes = [byte[]](255, 255, 255, 255) + [System.Text.Encoding]::UTF8.GetBytes("rcon $RconPassword $cmd")
+        [void]$udp.Send($bytes, $bytes.Length, '127.0.0.1', $RconPort)
+        $udp.Close()
+        return $true
+    } catch { return $false }
+}
+$script:profilerSaveDue = $null
+$script:profilerLastRun = [datetime]::MinValue
+$script:profilerCause   = ''
 
 function Get-CfxPlayers {
     # Player count from the FiveM master list API. Returns [int] or $null on failure.
@@ -487,6 +544,17 @@ function Raise-Alert([string]$severity, [string]$cause, [string]$detail, [ref]$a
     Write-Log ("ALERT [{0}] {1} :: {2}" -f $severity, $cause, $detail)
     $recentAlerts.Enqueue(@{ ts = $now.ToString('HH:mm:ss'); severity = $severity; cause = $cause; detail = $detail })
     while ($recentAlerts.Count -gt 15) { [void]$recentAlerts.Dequeue() }
+    # auto-profiler: start a capture when a configured trigger alert fires
+    if ($ProfilerActive -and $severity -ne 'INFO' -and $null -eq $script:profilerSaveDue -and
+        ($ProfilerTriggerSet -contains $cause) -and
+        ($now - $script:profilerLastRun).TotalSeconds -ge $ProfilerCooldownSec) {
+        if (Send-Rcon "profiler record $ProfilerFrames") {
+            $script:profilerLastRun = $now
+            $script:profilerCause   = $cause
+            $script:profilerSaveDue = $now.AddSeconds([math]::Ceiling($ProfilerFrames / 30) + 3)
+            Write-Log "Profiler: recording $ProfilerFrames frames (trigger: $cause)"
+        }
+    }
     if ($DiscordWebhook -and $severity -ne 'INFO') {
         try {
             $payload = (@{ content = ("**[{0}] {1}**`n{2}" -f $severity, $cause, $detail) } | ConvertTo-Json -Compress)
@@ -501,6 +569,12 @@ function Raise-Alert([string]$severity, [string]$cause, [string]$detail, [ref]$a
 }
 
 Write-Log "FiveM monitor started. Interval=${IntervalSec}s  Port=$ServerPort  Cores=$coreCount  Logs=$LogDir"
+if ($confPath) { Write-Log "Config: $confPath" }
+if ($ProfilerActive) {
+    Write-Log "Auto-profiler: ON  ($ProfilerFrames frames, cooldown ${ProfilerCooldownSec}s, triggers: $($ProfilerTriggerSet -join ', '))"
+} elseif ($ProfilerEnabled) {
+    Write-Log "Auto-profiler: PROFILER_ENABLED=true but RCON_PASSWORD is empty - feature disabled (set rcon_password in server.cfg and sentinel.conf)"
+}
 
 # ================================================================= MAIN LOOP
 while ($true) {
@@ -774,6 +848,15 @@ while ($true) {
                 Select-Object -First 5 | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join '; '
         Add-CsvLine 'events' $eventsHeader ("{0},top_error_resources,,{1}" -f `
             (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'), (CsvEscape $top))
+    }
+
+    # ---- auto-profiler: save a finished recording ----
+    if ($ProfilerActive -and $script:profilerSaveDue -and (Get-Date) -ge $script:profilerSaveDue) {
+        $pf = 'sentinel_profile_{0}.json' -f (Get-Date -Format 'yyyyMMdd_HHmmss')
+        if (Send-Rcon "profiler save $pf") {
+            Raise-Alert 'INFO' 'PROFILER_CAPTURED' ("Saved {0} in the server data directory (trigger: {1}). Inspect with: profiler view {0}" -f $pf, $script:profilerCause) ([ref]$alerts)
+        }
+        $script:profilerSaveDue = $null
     }
 
     # ---- sleep the remainder of the interval ----

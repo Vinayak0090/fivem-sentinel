@@ -22,7 +22,7 @@ Every 5 seconds the monitor records:
 - NIC bandwidth, with a slow-moving baseline so a spike is measured against *your* normal traffic
 - ping to the default gateway and to two independent external targets (1.1.1.1 and 8.8.8.8)
 
-It also tails the FXServer/txAdmin console log for hitch warnings, `SCRIPT ERROR` lines (with the resource name), and timeout messages.
+It also tails the FXServer/txAdmin console log for hitch warnings, `SCRIPT ERROR` lines (with the resource name), and timeout messages. Optionally, it can trigger FiveM's built-in profiler automatically when trouble starts (see below), so the capture exists from the exact moment things went wrong.
 
 When several players drop in one interval, it correlates everything and writes a `MASS_PLAYER_DROP` alert naming the suspects:
 
@@ -81,9 +81,25 @@ python3 tools/generate-report.py --date 2026-07-18
 
 ![Daily report](docs/report.png)
 
+## Automatic profiler capture
+
+When the cause is a script, FiveM's built-in profiler is the tool that names the guilty resource — but by the time you type `profiler record` in the console, the hitch is over. fivem-sentinel can do it for you: the moment a trigger alert fires (a hitch, a stalling server thread, a saturated core, a mass drop), it tells FXServer over RCON to record a profile and saves it as `sentinel_profile_<timestamp>.json` in the server data directory. A `PROFILER_CAPTURED` alert with the filename lands in the alert log and dashboard, and you open the capture from the server console with `profiler view <file>`.
+
+Turn it on in `sentinel.conf`:
+
+```ini
+PROFILER_ENABLED=true
+PROFILER_FRAMES=200      # 500 for a longer window
+PROFILER_TRIGGERS=SCRIPT_HITCH,SERVER_THREAD_SLOW,CPU_CORE_SATURATED,MASS_PLAYER_DROP
+PROFILER_COOLDOWN=600    # min seconds between captures
+RCON_PASSWORD=same-as-server-cfg
+```
+
+It needs `rcon_password` set in your `server.cfg` (the monitor talks to RCON from localhost only). Every knob is optional: change the frame count, trim or extend the trigger list, raise the cooldown, or set `PROFILER_ENABLED=false` and the feature is completely inert.
+
 ## Configuration
 
-Windows: parameters on `FiveM-Monitor.ps1`, forwarded through the installer with `-MonitorArgs`. Linux: environment variables with the same meanings.
+Both monitors read an optional `sentinel.conf` (KEY=VALUE — see [`sentinel.conf.example`](sentinel.conf.example)) placed next to the monitor script or in the repo root; it's the one file to edit on either platform. Beyond that — Windows: parameters on `FiveM-Monitor.ps1`, forwarded through the installer with `-MonitorArgs` (parameters override the file). Linux: environment variables with the same meanings (environment overrides the file).
 
 | Windows | Linux | Default | Purpose |
 |---|---|---|---|
@@ -94,6 +110,7 @@ Windows: parameters on `FiveM-Monitor.ps1`, forwarded through the installer with
 | `-DiscordWebhook` | `DISCORD_WEBHOOK` | off | post WARN/CRIT alerts to a Discord webhook |
 | `-DashboardPort` / `-DashboardBind` | `dashboard.py --port/--bind` | `8123` / localhost | live dashboard |
 | `-RetainDays` | `RETAIN_DAYS` | `14` | CSV retention |
+| `sentinel.conf` | `sentinel.conf` | off | `PROFILER_ENABLED`, `PROFILER_FRAMES`, `PROFILER_TRIGGERS`, `PROFILER_COOLDOWN`, `RCON_PASSWORD`, `RCON_PORT` — automatic profiler capture (both platforms) |
 
 Thresholds (what counts as a spike, how many players constitute a mass drop, and so on) sit in a clearly marked block at the top of each monitor and are meant to be tuned to your server's size.
 

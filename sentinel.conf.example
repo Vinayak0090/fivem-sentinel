@@ -1,0 +1,41 @@
+# fivem-sentinel configuration (optional)
+# Copy this file to "sentinel.conf" (same folder as the monitor script, or the
+# repo root) and edit. Both the Windows and Linux monitors read it.
+# Format: KEY=VALUE, one per line. Lines starting with # are ignored.
+# Explicit command-line parameters (Windows) / environment variables (Linux)
+# take precedence over this file.
+
+# ---- core ----
+#SERVER_PORT=30120
+#INTERVAL=5
+#CONSOLE_LOG=
+#EXT1=1.1.1.1
+#EXT2=8.8.8.8
+#DISCORD_WEBHOOK=
+
+# ---- automatic profiler capture ----
+# When one of the alerts listed in PROFILER_TRIGGERS fires, the monitor tells
+# FXServer over RCON to record a profile and saves it in the server data
+# directory as sentinel_profile_<timestamp>.json.
+# Open a capture from the server console with: profiler view <file>
+# Requires rcon_password to be set in your server.cfg (use the same value
+# here). Set PROFILER_ENABLED=true to turn the feature on.
+
+PROFILER_ENABLED=false
+
+# Frames to record per capture. 200 is a quick look (a few seconds);
+# 500 gives a longer window when hitches are intermittent.
+PROFILER_FRAMES=200
+
+# Which alerts start a capture, comma separated. Any alert cause from the
+# README table works - e.g. add POSSIBLE_DDOS, or trim the list down.
+PROFILER_TRIGGERS=SCRIPT_HITCH,SERVER_THREAD_SLOW,CPU_CORE_SATURATED,MASS_PLAYER_DROP
+
+# Minimum seconds between two captures, so a bad night doesn't fill the disk.
+PROFILER_COOLDOWN=600
+
+# Must match rcon_password in your server.cfg. Empty = feature stays off.
+RCON_PASSWORD=
+
+# RCON port. Defaults to SERVER_PORT.
+#RCON_PORT=30120

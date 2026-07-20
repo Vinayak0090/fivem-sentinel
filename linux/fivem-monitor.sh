@@ -18,17 +18,51 @@ set -u
 export LC_ALL=C
 
 # --------------------------------------------------------------- config
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Optional config file: sentinel.conf next to the script or in the repo root
+# (see sentinel.conf.example). Environment variables win over the file; the
+# file wins over the defaults below.
+CONF_FILE=""
+for _conf in "$SCRIPT_DIR/sentinel.conf" "$SCRIPT_DIR/../sentinel.conf"; do
+  [ -f "$_conf" ] || continue
+  while IFS='=' read -r _k _v; do
+    _k="${_k//[[:space:]]/}"
+    case "$_k" in ''|\#*) continue ;; esac
+    _v="${_v%$'\r'}"
+    _v="$(printf '%s' "$_v" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    _v="${_v%\"}"; _v="${_v#\"}"
+    case "$_k" in
+      INTERVAL|SERVER_PORT|CONSOLE_LOG|TXDATA_ROOT|EXT1|EXT2|LOG_DIR|RETAIN_DAYS|DISCORD_WEBHOOK|FX_PROCESS|PROFILER_ENABLED|PROFILER_FRAMES|PROFILER_TRIGGERS|PROFILER_COOLDOWN|RCON_PASSWORD|RCON_PORT)
+        eval "_cur=\"\${$_k:-}\""
+        [ -z "$_cur" ] && eval "$_k=\"\$_v\""
+        ;;
+    esac
+  done < "$_conf"
+  CONF_FILE="$_conf"
+  break
+done
+
 INTERVAL="${INTERVAL:-5}"
 SERVER_PORT="${SERVER_PORT:-30120}"
 CONSOLE_LOG="${CONSOLE_LOG:-}"              # fxserver.log path; auto-detected if empty
 TXDATA_ROOT="${TXDATA_ROOT:-$HOME}"         # searched for txData/*/logs/fxserver.log
 EXT1="${EXT1:-1.1.1.1}"
 EXT2="${EXT2:-8.8.8.8}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="${LOG_DIR:-$SCRIPT_DIR/logs}"
 RETAIN_DAYS="${RETAIN_DAYS:-14}"
 DISCORD_WEBHOOK="${DISCORD_WEBHOOK:-}"
 FX_PROCESS="${FX_PROCESS:-FXServer}"
+
+# auto-profiler (see sentinel.conf.example)
+PROFILER_ENABLED="${PROFILER_ENABLED:-false}"
+PROFILER_FRAMES="${PROFILER_FRAMES:-200}"
+PROFILER_TRIGGERS="${PROFILER_TRIGGERS:-SCRIPT_HITCH,SERVER_THREAD_SLOW,CPU_CORE_SATURATED,MASS_PLAYER_DROP}"
+PROFILER_COOLDOWN="${PROFILER_COOLDOWN:-600}"
+RCON_PASSWORD="${RCON_PASSWORD:-}"
+RCON_PORT="${RCON_PORT:-$SERVER_PORT}"
+PROFILER_ACTIVE=0
+if [ "$PROFILER_ENABLED" = "true" ] && [ -n "$RCON_PASSWORD" ]; then PROFILER_ACTIVE=1; fi
 
 # thresholds
 T_CPU_CORE_HIGH=95        # single core pegged (FiveM main thread is single-core bound)
@@ -175,6 +209,16 @@ players_json() { # -> "count ms ok"
   echo "$cnt $ms $ok"
 }
 
+# ---------------------------------------------------- rcon / auto-profiler
+# Fire-and-forget console command over FiveM's rcon (UDP, Quake-style OOB).
+rcon_send() { # command
+  [ -z "$RCON_PASSWORD" ] && return 1
+  printf '\xff\xff\xff\xffrcon %s %s' "$RCON_PASSWORD" "$1" > "/dev/udp/127.0.0.1/$RCON_PORT" 2>/dev/null
+}
+PROFILER_SAVE_DUE=""
+PROFILER_LAST=0
+PROFILER_CAUSE=""
+
 # ----------------------------------------------------------------- alerts
 declare -A LAST_ALERT
 RECENT_ALERTS=()   # json objects, newest last
@@ -191,6 +235,20 @@ raise_alert() { # severity cause detail
   local esc="${3//\\/\\\\}"; esc="${esc//\"/\\\"}"
   RECENT_ALERTS+=("{\"ts\":\"$(date +%H:%M:%S)\",\"severity\":\"$1\",\"cause\":\"$2\",\"detail\":\"$esc\"}")
   [ "${#RECENT_ALERTS[@]}" -gt 15 ] && RECENT_ALERTS=("${RECENT_ALERTS[@]:1}")
+  # auto-profiler: start a capture when a configured trigger alert fires
+  if [ "$PROFILER_ACTIVE" = 1 ] && [ "$1" != "INFO" ] && [ -z "$PROFILER_SAVE_DUE" ]; then
+    case ",$PROFILER_TRIGGERS," in
+      *",$2,"*)
+        if [ $((epoch - PROFILER_LAST)) -ge "$PROFILER_COOLDOWN" ]; then
+          if rcon_send "profiler record $PROFILER_FRAMES"; then
+            PROFILER_LAST=$epoch
+            PROFILER_CAUSE="$2"
+            PROFILER_SAVE_DUE=$((epoch + PROFILER_FRAMES / 30 + 3))
+            log "Profiler: recording $PROFILER_FRAMES frames (trigger: $2)"
+          fi
+        fi ;;
+    esac
+  fi
   if [ -n "$DISCORD_WEBHOOK" ] && [ "$1" != "INFO" ]; then
     curl -s -m 3 -H 'Content-Type: application/json' \
       -d "{\"content\":\"**[$1] $2**\\n$esc\"}" "$DISCORD_WEBHOOK" >/dev/null 2>&1 &
@@ -212,6 +270,12 @@ EMA_UDP=""; EMA_MBPS=""
 HIST=()   # dashboard history ring
 
 log "fivem-sentinel started. Interval=${INTERVAL}s Port=$SERVER_PORT Cores=$NCORES Logs=$LOG_DIR"
+[ -n "$CONF_FILE" ] && log "Config: $CONF_FILE"
+if [ "$PROFILER_ACTIVE" = 1 ]; then
+  log "Auto-profiler: ON ($PROFILER_FRAMES frames, cooldown ${PROFILER_COOLDOWN}s, triggers: $PROFILER_TRIGGERS)"
+elif [ "$PROFILER_ENABLED" = "true" ]; then
+  log "Auto-profiler: PROFILER_ENABLED=true but RCON_PASSWORD is empty - feature disabled"
+fi
 
 # ================================================================ main loop
 while true; do
@@ -407,6 +471,15 @@ while true; do
     fi
     printf ']}'
   } > "$LOG_DIR/live.json.tmp" && mv "$LOG_DIR/live.json.tmp" "$LOG_DIR/live.json"
+
+  # ---- auto-profiler: save a finished recording ----
+  if [ -n "$PROFILER_SAVE_DUE" ] && [ "$(date +%s)" -ge "$PROFILER_SAVE_DUE" ]; then
+    PF="sentinel_profile_$(date +%Y%m%d_%H%M%S).json"
+    if rcon_send "profiler save $PF"; then
+      raise_alert INFO PROFILER_CAPTURED "Saved $PF in the server data directory (trigger: $PROFILER_CAUSE). Inspect with: profiler view $PF"
+    fi
+    PROFILER_SAVE_DUE=""
+  fi
 
   # ---- sleep out the interval ----
   ELAPSED=$(( $(date +%s) - CYCLE_START ))

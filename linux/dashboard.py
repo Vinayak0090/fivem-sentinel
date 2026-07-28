@@ -12,10 +12,13 @@ it, restrict the port to your own IP in the firewall - there is no auth.
 import argparse
 import http.server
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ASSETS = os.path.join(os.path.dirname(HERE), "assets")
+# the monitor names captures itself, so anything else is not ours to serve
+PROFILE_RE = re.compile(r"/profiles/(sentinel_profile_[0-9_]+\.json)$")
 
 
 def main():
@@ -28,6 +31,7 @@ def main():
     dash_path = os.path.join(ASSETS, "dashboard.html")
     chart_path = os.path.join(ASSETS, "chart.umd.min.js")
     live_path = os.path.join(args.logs, "live.json")
+    profile_dir = os.path.join(args.logs, "profiles")
 
     if not os.path.isfile(dash_path):
         sys.exit(f"dashboard.html not found at {dash_path}")
@@ -43,13 +47,28 @@ def main():
 
         def do_GET(self):
             try:
+                m = PROFILE_RE.search(self.path)
                 if self.path.rstrip("/").endswith("data"):
                     try:
                         with open(live_path, "rb") as f:
                             body = f.read()
                     except OSError:
-                        body = b'{"now":{},"hist":[],"alerts":[]}'
+                        body = b'{"now":{},"hist":[],"alerts":[],"profiles":[]}'
                     self._send(200, "application/json", body)
+                elif m:
+                    try:
+                        with open(os.path.join(profile_dir, m.group(1)), "rb") as f:
+                            body = f.read()
+                    except OSError:
+                        self._send(404, "text/plain", b"not found")
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Disposition",
+                                     'attachment; filename="%s"' % m.group(1))
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
                 elif self.path.endswith("chart.js"):
                     try:
                         with open(chart_path, "rb") as f:

@@ -33,7 +33,7 @@ for _conf in "$SCRIPT_DIR/sentinel.conf" "$SCRIPT_DIR/../sentinel.conf"; do
     _v="$(printf '%s' "$_v" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     _v="${_v%\"}"; _v="${_v#\"}"
     case "$_k" in
-      INTERVAL|SERVER_PORT|CONSOLE_LOG|TXDATA_ROOT|EXT1|EXT2|LOG_DIR|RETAIN_DAYS|DISCORD_WEBHOOK|FX_PROCESS|PROFILER_ENABLED|PROFILER_FRAMES|PROFILER_TRIGGERS|PROFILER_COOLDOWN|RCON_PASSWORD|RCON_PORT)
+      INTERVAL|SERVER_PORT|CONSOLE_LOG|TXDATA_ROOT|EXT1|EXT2|LOG_DIR|RETAIN_DAYS|DISCORD_WEBHOOK|FX_PROCESS|PROFILER_ENABLED|PROFILER_FRAMES|PROFILER_TRIGGERS|PROFILER_COOLDOWN|PROFILER_KEEP|RCON_PASSWORD|RCON_PORT|SERVER_ROOT)
         eval "_cur=\"\${$_k:-}\""
         [ -z "$_cur" ] && eval "$_k=\"\$_v\""
         ;;
@@ -59,8 +59,11 @@ PROFILER_ENABLED="${PROFILER_ENABLED:-false}"
 PROFILER_FRAMES="${PROFILER_FRAMES:-200}"
 PROFILER_TRIGGERS="${PROFILER_TRIGGERS:-SCRIPT_HITCH,SERVER_THREAD_SLOW,CPU_CORE_SATURATED,MASS_PLAYER_DROP}"
 PROFILER_COOLDOWN="${PROFILER_COOLDOWN:-600}"
+PROFILER_KEEP="${PROFILER_KEEP:-20}"
 RCON_PASSWORD="${RCON_PASSWORD:-}"
 RCON_PORT="${RCON_PORT:-$SERVER_PORT}"
+SERVER_ROOT="${SERVER_ROOT:-}"              # where FXServer runs; auto-detected via /proc
+PROFILE_DIR="$LOG_DIR/profiles"             # captures are moved here for the dashboard
 PROFILER_ACTIVE=0
 if [ "$PROFILER_ENABLED" = "true" ] && [ -n "$RCON_PASSWORD" ]; then PROFILER_ACTIVE=1; fi
 
@@ -218,6 +221,68 @@ rcon_send() { # command
 PROFILER_SAVE_DUE=""
 PROFILER_LAST=0
 PROFILER_CAUSE=""
+PROFILER_COLLECT_DUE=""
+PROFILER_COLLECT_FILE=""
+PROFILER_COLLECT_CAUSE=""
+PROFILE_SRC_DIR=""
+PROFILES=()   # json objects, newest first
+
+# FXServer writes "profiler saveJSON <name>" into its own working directory,
+# which is nowhere near this script. /proc tells us exactly where that is, so
+# the file gets moved into logs/profiles and served by the dashboard.
+profile_dirs() {
+  local d
+  for d in "$PROFILE_SRC_DIR" "$SERVER_ROOT"; do
+    [ -n "$d" ] && [ -d "$d" ] && printf '%s\n' "$d"
+  done
+  if [ -n "${FX_PID:-}" ] && [ "$FX_PID" != "-1" ] && [ -r "/proc/$FX_PID/cwd" ]; then
+    d="$(readlink -f "/proc/$FX_PID/cwd" 2>/dev/null || true)"
+    [ -n "$d" ] && printf '%s\n' "$d"
+  fi
+  # .../txData/<profile>/logs/fxserver.log -> the folder holding txData
+  if [ -n "${CONSOLE_LOG:-}" ]; then
+    d="$(dirname "$CONSOLE_LOG")"
+    while [ "$d" != "/" ] && [ -n "$d" ]; do
+      printf '%s\n' "$d"
+      if [ "$(basename "$d")" = "txData" ]; then printf '%s\n' "$(dirname "$d")"; break; fi
+      d="$(dirname "$d")"
+    done
+  fi
+}
+
+# Sets PROF_KB and remembers the directory that worked. Returns 1 if the file
+# never turned up. Not a command substitution - that would run it in a subshell
+# and throw the remembered directory away.
+PROF_KB=0
+collect_profile() { # filename
+  local d src
+  while read -r d; do
+    src="$d/$1"
+    [ -f "$src" ] || continue
+    mkdir -p "$PROFILE_DIR" || return 1
+    mv -f "$src" "$PROFILE_DIR/$1" 2>/dev/null || return 1
+    PROFILE_SRC_DIR="$d"
+    PROF_KB="$(du -k "$PROFILE_DIR/$1" 2>/dev/null | cut -f1)"
+    PROF_KB="${PROF_KB//[^0-9]/}"
+    [ -z "$PROF_KB" ] && PROF_KB=0
+    return 0
+  done < <(profile_dirs)
+  return 1
+}
+
+# Newest first, trimmed to PROFILER_KEEP; the dropped files go with it.
+add_profile() { # json
+  local last dropped fn
+  PROFILES=("$1" ${PROFILES[@]+"${PROFILES[@]}"})
+  while [ "${#PROFILES[@]}" -gt "$PROFILER_KEEP" ]; do
+    last=$(( ${#PROFILES[@]} - 1 ))
+    dropped="${PROFILES[$last]}"
+    unset 'PROFILES[last]'
+    PROFILES=(${PROFILES[@]+"${PROFILES[@]}"})
+    fn="$(printf '%s' "$dropped" | sed -n 's/.*"file":"\([^"]*\)".*/\1/p')"
+    [ -n "$fn" ] && rm -f "$PROFILE_DIR/$fn"
+  done
+}
 
 # ----------------------------------------------------------------- alerts
 declare -A LAST_ALERT
@@ -273,6 +338,7 @@ log "fivem-sentinel started. Interval=${INTERVAL}s Port=$SERVER_PORT Cores=$NCOR
 [ -n "$CONF_FILE" ] && log "Config: $CONF_FILE"
 if [ "$PROFILER_ACTIVE" = 1 ]; then
   log "Auto-profiler: ON ($PROFILER_FRAMES frames, cooldown ${PROFILER_COOLDOWN}s, triggers: $PROFILER_TRIGGERS)"
+  log "Captures land in $PROFILE_DIR and show up on the dashboard."
 elif [ "$PROFILER_ENABLED" = "true" ]; then
   log "Auto-profiler: PROFILER_ENABLED=true but RCON_PASSWORD is empty - feature disabled"
 fi
@@ -469,6 +535,8 @@ while true; do
         [ "$idx" -gt 0 ] && printf ','
       done
     fi
+    printf '],"profiles":['
+    if [ "${#PROFILES[@]}" -gt 0 ]; then (IFS=,; printf '%s' "${PROFILES[*]}"); fi
     printf ']}'
   } > "$LOG_DIR/live.json.tmp" && mv "$LOG_DIR/live.json.tmp" "$LOG_DIR/live.json"
 
@@ -476,9 +544,23 @@ while true; do
   if [ -n "$PROFILER_SAVE_DUE" ] && [ "$(date +%s)" -ge "$PROFILER_SAVE_DUE" ]; then
     PF="sentinel_profile_$(date +%Y%m%d_%H%M%S).json"
     if rcon_send "profiler saveJSON $PF"; then
-      raise_alert INFO PROFILER_CAPTURED "Saved $PF in the server root folder (trigger: $PROFILER_CAUSE). Open it in Chrome: F12 > Performance tab > right-click > Load profile (or chrome://tracing / ui.perfetto.dev)."
+      PROFILER_COLLECT_DUE=$(( $(date +%s) + 5 ))
+      PROFILER_COLLECT_FILE="$PF"
+      PROFILER_COLLECT_CAUSE="$PROFILER_CAUSE"
     fi
     PROFILER_SAVE_DUE=""
+  fi
+
+  # ---- auto-profiler: pull the finished file into logs/profiles ----
+  if [ -n "$PROFILER_COLLECT_DUE" ] && [ "$(date +%s)" -ge "$PROFILER_COLLECT_DUE" ]; then
+    if collect_profile "$PROFILER_COLLECT_FILE"; then
+      add_profile "{\"ts\":\"$(date +%H:%M:%S)\",\"cause\":\"$PROFILER_COLLECT_CAUSE\",\"file\":\"$PROFILER_COLLECT_FILE\",\"kb\":$PROF_KB,\"local\":true}"
+      raise_alert INFO PROFILER_CAPTURED "$PROFILER_COLLECT_FILE ($PROF_KB KB, trigger: $PROFILER_COLLECT_CAUSE) - download it from the dashboard's Captured profiles panel, or open $PROFILE_DIR/$PROFILER_COLLECT_FILE in Chrome: F12 > Performance > right-click > Load profile."
+    else
+      add_profile "{\"ts\":\"$(date +%H:%M:%S)\",\"cause\":\"$PROFILER_COLLECT_CAUSE\",\"file\":\"$PROFILER_COLLECT_FILE\",\"kb\":null,\"local\":false}"
+      raise_alert INFO PROFILER_CAPTURED "$PROFILER_COLLECT_FILE saved by FXServer (trigger: $PROFILER_COLLECT_CAUSE) but not found in the folders I checked - set SERVER_ROOT in sentinel.conf to the folder FXServer runs from and I'll collect the next one."
+    fi
+    PROFILER_COLLECT_DUE=""
   fi
 
   # ---- sleep out the interval ----

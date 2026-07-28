@@ -83,9 +83,11 @@ python3 tools/generate-report.py --date 2026-07-18
 
 ## Automatic profiler capture
 
-When the cause is a script, FiveM's built-in profiler is the tool that names the guilty resource — but by the time you type `profiler record` in the console, the hitch is over. fivem-sentinel can do it for you: the moment a trigger alert fires (a hitch, a stalling server thread, a saturated core, a mass drop), it tells FXServer over RCON to `profiler record` and then `profiler saveJSON`, saving `sentinel_profile_<timestamp>.json` in the server root folder (where FXServer runs). A `PROFILER_CAPTURED` alert with the filename lands in the alert log and dashboard.
+When the cause is a script, FiveM's built-in profiler is the tool that names the guilty resource — but by the time you type `profiler record` in the console, the hitch is over. fivem-sentinel can do it for you: the moment a trigger alert fires (a hitch, a stalling server thread, a saturated core, a mass drop), it tells FXServer over RCON to `profiler record` and then `profiler saveJSON`.
 
-To open a saved capture there is no console command — you load the JSON in Chrome: press `F12`, open the **Performance** tab, right-click the panel and choose **Load profile**, then pick the file (dragging it into `chrome://tracing` or [ui.perfetto.dev](https://ui.perfetto.dev) also works). The resource holding the longest block during the hitch is your culprit. If the capture came from a `MASS_PLAYER_DROP` but the timeline looks clean, that's itself a signal — the server thread was fine, so the drop came from outside the box: network or DDoS.
+FXServer drops that file in its own working directory, which is rarely where you want it, so the monitor goes and gets it: the capture is moved into `logs/profiles/` and listed in the **Captured profiles** panel on the live dashboard with its trigger, size and a Download button. No hunting around the server over RDP, no console commands.
+
+To read a capture, load the JSON in Chrome: press `F12`, open the **Performance** tab, right-click the panel and choose **Load profile**, then pick the file (dragging it into `chrome://tracing` or [ui.perfetto.dev](https://ui.perfetto.dev) also works). The resource holding the longest block during the hitch is your culprit. If the capture came from a `MASS_PLAYER_DROP` but the timeline looks clean, that's itself a signal — the server thread was fine, so the drop came from outside the box: network or DDoS.
 
 To profile live instead of from a file, run `profiler record 500` then `profiler view` in the server console — `view` opens the current in-memory recording directly.
 
@@ -96,10 +98,13 @@ PROFILER_ENABLED=true
 PROFILER_FRAMES=200      # 500 for a longer window
 PROFILER_TRIGGERS=SCRIPT_HITCH,SERVER_THREAD_SLOW,CPU_CORE_SATURATED,MASS_PLAYER_DROP
 PROFILER_COOLDOWN=600    # min seconds between captures
+PROFILER_KEEP=20         # captures kept on disk
 RCON_PASSWORD=same-as-server-cfg
 ```
 
 It needs `rcon_password` set in your `server.cfg` (the monitor talks to RCON from localhost only). Every knob is optional: change the frame count, trim or extend the trigger list, raise the cooldown, or set `PROFILER_ENABLED=false` and the feature is completely inert.
+
+Finding the file is normally automatic — the monitor checks the FXServer process's working directory and the folder holding `txData`. On an unusual layout it will say so in the alert; point `SERVER_ROOT` at the folder FXServer runs from and the next capture gets collected.
 
 ## Configuration
 
@@ -114,7 +119,7 @@ Both monitors read an optional `sentinel.conf` (KEY=VALUE — see [`sentinel.con
 | `-DiscordWebhook` | `DISCORD_WEBHOOK` | off | post WARN/CRIT alerts to a Discord webhook |
 | `-DashboardPort` / `-DashboardBind` | `dashboard.py --port/--bind` | `8123` / localhost | live dashboard |
 | `-RetainDays` | `RETAIN_DAYS` | `14` | CSV retention |
-| `sentinel.conf` | `sentinel.conf` | off | `PROFILER_ENABLED`, `PROFILER_FRAMES`, `PROFILER_TRIGGERS`, `PROFILER_COOLDOWN`, `RCON_PASSWORD`, `RCON_PORT` — automatic profiler capture (both platforms) |
+| `sentinel.conf` | `sentinel.conf` | off | `PROFILER_ENABLED`, `PROFILER_FRAMES`, `PROFILER_TRIGGERS`, `PROFILER_COOLDOWN`, `PROFILER_KEEP`, `RCON_PASSWORD`, `RCON_PORT`, `SERVER_ROOT` — automatic profiler capture (both platforms) |
 
 Thresholds (what counts as a spike, how many players constitute a mass drop, and so on) sit in a clearly marked block at the top of each monitor and are meant to be tuned to your server's size.
 
@@ -122,7 +127,7 @@ To view the dashboard from another machine, bind it to all interfaces and open t
 
 ## Output
 
-Daily rolling CSVs under `logs/` — `metrics-*.csv` (one row per sample), `alerts-*.csv` (problems + suspected cause), `events-*.csv` (hitch/script-error/timeout console lines with resource names). The CSV layout is identical on both platforms, so `tools/generate-report.py` works with either, and you can throw the files at a spreadsheet if you prefer.
+Daily rolling CSVs under `logs/` — `metrics-*.csv` (one row per sample), `alerts-*.csv` (problems + suspected cause), `events-*.csv` (hitch/script-error/timeout console lines with resource names). The CSV layout is identical on both platforms, so `tools/generate-report.py` works with either, and you can throw the files at a spreadsheet if you prefer. Profiler captures, if enabled, collect in `logs/profiles/`.
 
 ## Notes
 

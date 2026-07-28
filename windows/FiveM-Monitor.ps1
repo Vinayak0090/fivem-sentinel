@@ -853,8 +853,8 @@ while ($true) {
     # ---- auto-profiler: save a finished recording ----
     if ($ProfilerActive -and $script:profilerSaveDue -and (Get-Date) -ge $script:profilerSaveDue) {
         $pf = 'sentinel_profile_{0}.json' -f (Get-Date -Format 'yyyyMMdd_HHmmss')
-        if (Send-Rcon "profiler save $pf") {
-            Raise-Alert 'INFO' 'PROFILER_CAPTURED' ("Saved {0} in the server data directory (trigger: {1}). Inspect with: profiler view {0}" -f $pf, $script:profilerCause) ([ref]$alerts)
+        if (Send-Rcon "profiler saveJSON $pf") {
+            Raise-Alert 'INFO' 'PROFILER_CAPTURED' ("Saved {0} in the server root folder (trigger: {1}). Open it in Chrome: F12 > Performance tab > right-click > Load profile (or chrome://tracing / ui.perfetto.dev)." -f $pf, $script:profilerCause) ([ref]$alerts)
         }
         $script:profilerSaveDue = $null
     }

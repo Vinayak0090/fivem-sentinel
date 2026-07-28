@@ -49,6 +49,13 @@
   .sev-crit{background:var(--st-critical)} .sev-warn{background:var(--st-warning);color:#0b0b0b}
   .sev-info{background:var(--muted)}
   .muted{color:var(--muted)}
+  a{color:var(--s-blue)}
+  .hint{font-size:11px;color:var(--muted);margin-top:8px;line-height:1.6}
+  .hint code{font-family:ui-monospace,Menlo,Consolas,monospace;background:var(--grid);
+             padding:1px 4px;border-radius:4px;color:var(--text-secondary)}
+  .btn{display:inline-block;padding:2px 9px;border:1px solid var(--border);border-radius:6px;
+       background:var(--page);color:var(--s-blue);font-size:11px;font-weight:600;text-decoration:none}
+  .btn:hover{border-color:var(--s-blue)}
 </style>
 </head>
 <body>
@@ -76,6 +83,13 @@
   <div class="card"><h2>Recent alerts</h2>
     <table><thead><tr><th>Time</th><th>Sev</th><th>Cause</th><th>Detail</th></tr></thead>
     <tbody id="alerts"><tr><td colspan="4" class="muted">none yet</td></tr></tbody></table>
+  </div>
+
+  <div class="card"><h2>Captured profiles</h2>
+    <table><thead><tr><th>Captured</th><th>Trigger</th><th>Size</th><th></th></tr></thead>
+    <tbody id="profiles"><tr><td colspan="4" class="muted">none yet</td></tr></tbody></table>
+    <div class="hint" id="profHint">Automatic profiler captures appear here. Turn them on with
+      <code>PROFILER_ENABLED=true</code> and <code>RCON_PASSWORD</code> in <code>sentinel.conf</code>.</div>
   </div>
 </div></div>
 <script>
@@ -120,6 +134,34 @@ function setChart(id, labels, seriesData){
   c.update('none');
 }
 function nn(v){ return (v==null || v<0) ? null : v; }
+// PowerShell's ConvertTo-Json collapses one-element arrays into bare objects.
+function arr(v){ return v == null ? [] : (Array.isArray(v) ? v : [v]); }
+
+const HINT_IDLE = 'Automatic profiler captures appear here. Turn them on with ' +
+  '<code>PROFILER_ENABLED=true</code> and <code>RCON_PASSWORD</code> in <code>sentinel.conf</code>.';
+const HINT_HAVE = 'Download a capture, then open it in Chrome: <b>F12</b> &rarr; <b>Performance</b> tab &rarr; ' +
+  'right-click the panel &rarr; <b>Load profile</b>. ' +
+  '<a href="https://ui.perfetto.dev" target="_blank" rel="noopener">ui.perfetto.dev</a> and ' +
+  '<code>chrome://tracing</code> read the same files. ' +
+  'The resource holding the longest block during the hitch is your culprit.';
+function renderProfiles(list){
+  const tb = document.getElementById('profiles');
+  if (!list.length){
+    tb.innerHTML = '<tr><td colspan="4" class="muted">none yet</td></tr>';
+    document.getElementById('profHint').innerHTML = HINT_IDLE;
+    return;
+  }
+  document.getElementById('profHint').innerHTML = HINT_HAVE;
+  tb.innerHTML = list.map(p=>{
+    const size = p.kb == null ? '' : (p.kb >= 1024 ? (p.kb/1024).toFixed(1)+' MB' : p.kb+' KB');
+    const cell = p.local
+      ? '<a class="btn" href="profiles/'+encodeURIComponent(p.file)+'" download>Download</a>'
+      : '<span class="muted" title="'+esc(p.file)+'">in the server folder</span>';
+    return '<tr><td class="mono">'+esc(p.ts)+'</td><td class="cause">'+esc(p.cause)+'</td>'+
+           '<td class="mono">'+esc(size)+'</td><td>'+cell+'</td></tr>';
+  }).join('');
+}
+
 let lastOk = 0;
 async function tick(){
   try{
@@ -132,13 +174,13 @@ async function tick(){
     set('tPlayers', now.players); set('tHttp', now.httpMs); set('tCore', now.cpuMax);
     set('tFxCpu', now.fxCpu); set('tRam', now.ramAvail); set('tUdp', now.udpIn); set('tPing', now.pingExt);
     document.getElementById('upd').textContent = now.ts || '-';
-    const h = d.hist || [];
+    const h = arr(d.hist);
     const L = h.map(x=>x.t);
     setChart('cPlayers', L, [h.map(x=>nn(x.p))]);
     setChart('cCpu', L, [h.map(x=>nn(x.cm)), h.map(x=>nn(x.ct)), h.map(x=>nn(x.fc))]);
     setChart('cUdp', L, [h.map(x=>nn(x.ui)), h.map(x=>nn(x.un))]);
     setChart('cPing', L, [h.map(x=>nn(x.p1)), h.map(x=>nn(x.p2))]);
-    const al = d.alerts || [];
+    const al = arr(d.alerts);
     document.getElementById('alerts').innerHTML = al.length === 0
       ? '<tr><td colspan="4" class="muted">none yet</td></tr>'
       : al.map(a=>{
@@ -146,6 +188,7 @@ async function tick(){
           return '<tr><td class="mono">'+esc(a.ts)+'</td><td><span class="pill '+cls+'">'+esc(a.severity)+'</span></td>'+
                  '<td class="cause">'+esc(a.cause)+'</td><td>'+esc(a.detail)+'</td></tr>';
         }).join('');
+    renderProfiles(arr(d.profiles));
   }catch(e){}
   document.getElementById('dot').className = 'dot' + ((Date.now()-lastOk) > 20000 ? ' stale' : '');
 }

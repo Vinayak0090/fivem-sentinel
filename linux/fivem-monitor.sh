@@ -475,8 +475,8 @@ while true; do
   # ---- auto-profiler: save a finished recording ----
   if [ -n "$PROFILER_SAVE_DUE" ] && [ "$(date +%s)" -ge "$PROFILER_SAVE_DUE" ]; then
     PF="sentinel_profile_$(date +%Y%m%d_%H%M%S).json"
-    if rcon_send "profiler save $PF"; then
-      raise_alert INFO PROFILER_CAPTURED "Saved $PF in the server data directory (trigger: $PROFILER_CAUSE). Inspect with: profiler view $PF"
+    if rcon_send "profiler saveJSON $PF"; then
+      raise_alert INFO PROFILER_CAPTURED "Saved $PF in the server root folder (trigger: $PROFILER_CAUSE). Open it in Chrome: F12 > Performance tab > right-click > Load profile (or chrome://tracing / ui.perfetto.dev)."
     fi
     PROFILER_SAVE_DUE=""
   fi

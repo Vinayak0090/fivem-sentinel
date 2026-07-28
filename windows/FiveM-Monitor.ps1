@@ -85,7 +85,7 @@ $bound = $PSBoundParameters
 # settings only live here - see sentinel.conf.example.
 $ProfilerEnabled = $false; $ProfilerFrames = 200; $ProfilerCooldownSec = 600
 $ProfilerTriggers = 'SCRIPT_HITCH,SERVER_THREAD_SLOW,CPU_CORE_SATURATED,MASS_PLAYER_DROP'
-$RconPassword = ''; $RconPort = 0
+$RconPassword = ''; $RconPort = 0; $ServerRoot = ''; $ProfilerKeep = 20
 $confPath = @((Join-Path $scriptRoot 'sentinel.conf'),
               (Join-Path (Split-Path -Parent $scriptRoot) 'sentinel.conf')) |
     Where-Object { Test-Path $_ } | Select-Object -First 1
@@ -112,8 +112,10 @@ if ($confPath) {
     if ($conf['PROFILER_FRAMES'])   { $ProfilerFrames = [int]$conf['PROFILER_FRAMES'] }
     if ($conf['PROFILER_TRIGGERS']) { $ProfilerTriggers = $conf['PROFILER_TRIGGERS'] }
     if ($conf['PROFILER_COOLDOWN']) { $ProfilerCooldownSec = [int]$conf['PROFILER_COOLDOWN'] }
+    if ($conf['PROFILER_KEEP'])     { $ProfilerKeep = [int]$conf['PROFILER_KEEP'] }
     if ($conf['RCON_PASSWORD'])     { $RconPassword = $conf['RCON_PASSWORD'] }
     if ($conf['RCON_PORT'])         { $RconPort = [int]$conf['RCON_PORT'] }
+    if ($conf['SERVER_ROOT'])       { $ServerRoot = $conf['SERVER_ROOT'] }
 }
 if ($RconPort -eq 0) { $RconPort = $ServerPort }
 $ProfilerTriggerSet = @($ProfilerTriggers -split ',' | ForEach-Object { $_.Trim().ToUpper() } | Where-Object { $_ })
@@ -121,6 +123,9 @@ $ProfilerActive = [bool]($ProfilerEnabled -and $RconPassword)
 
 if (-not $LogDir) { $LogDir = Join-Path $scriptRoot 'logs' }
 New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+# Captures are pulled out of the server folder into here so the dashboard can
+# hand them to you as a download instead of you hunting for them over RDP.
+$ProfileDir = Join-Path $LogDir 'profiles'
 
 # Keep ourselves cheap: below-normal priority, single threaded apartment.
 try { (Get-Process -Id $PID).PriorityClass = 'BelowNormal' } catch {}
@@ -250,9 +255,69 @@ function Send-Rcon([string]$cmd) {
         return $true
     } catch { return $false }
 }
-$script:profilerSaveDue = $null
-$script:profilerLastRun = [datetime]::MinValue
-$script:profilerCause   = ''
+$script:profilerSaveDue    = $null
+$script:profilerCollect    = $null   # @{ due = <datetime>; file = <name>; cause = <string> }
+$script:profilerLastRun    = [datetime]::MinValue
+$script:profilerCause      = ''
+$script:profilerSrcDir     = ''      # remembered once we know where FXServer drops files
+$script:fxExeDir           = ''
+$script:profileList        = New-Object System.Collections.ArrayList
+
+# FXServer writes "profiler saveJSON <name>" into its own working directory,
+# which is nowhere near this script. Rather than make you go find it, guess the
+# handful of places it can be, then move the file into logs\profiles so the
+# dashboard can serve it. The directory that works is remembered.
+function Get-ProfileSearchDirs {
+    $dirs = New-Object System.Collections.ArrayList
+    foreach ($d in @($script:profilerSrcDir, $ServerRoot, $script:fxExeDir)) {
+        if ($d -and (Test-Path -LiteralPath $d)) { [void]$dirs.Add($d) }
+    }
+    if ($script:fxExeDir) {
+        $p = Split-Path -Parent $script:fxExeDir
+        if ($p -and (Test-Path -LiteralPath $p)) { [void]$dirs.Add($p) }
+    }
+    # ...\txData\<profile>\logs\fxserver.log -> the folder holding txData is
+    # the usual working directory for a txAdmin-managed server.
+    if ($resolvedLog) {
+        $walk = Split-Path -Parent $resolvedLog
+        while ($walk) {
+            $leaf = Split-Path -Leaf $walk
+            [void]$dirs.Add($walk)
+            if ($leaf -eq 'txData') { [void]$dirs.Add((Split-Path -Parent $walk)); break }
+            $next = Split-Path -Parent $walk
+            if ($next -eq $walk) { break }
+            $walk = $next
+        }
+    }
+    return @($dirs | Where-Object { $_ } | Select-Object -Unique)
+}
+
+function Collect-Profile([string]$name, [string]$cause) {
+    foreach ($d in (Get-ProfileSearchDirs)) {
+        $src = Join-Path $d $name
+        if (-not (Test-Path -LiteralPath $src)) { continue }
+        try {
+            New-Item -ItemType Directory -Path $ProfileDir -Force | Out-Null
+            $dst = Join-Path $ProfileDir $name
+            Move-Item -LiteralPath $src -Destination $dst -Force
+            $script:profilerSrcDir = $d
+            return @{ ok = $true; path = $dst; kb = [int]((Get-Item -LiteralPath $dst).Length / 1KB) }
+        } catch {
+            return @{ ok = $false; dir = $d }
+        }
+    }
+    return @{ ok = $false }
+}
+
+# Newest first, trimmed to PROFILER_KEEP; older files are deleted with them.
+function Add-ProfileEntry([hashtable]$entry) {
+    [void]$script:profileList.Insert(0, $entry)
+    while ($script:profileList.Count -gt $ProfilerKeep) {
+        $old = $script:profileList[$script:profileList.Count - 1]
+        $script:profileList.RemoveAt($script:profileList.Count - 1)
+        if ($old.local) { try { Remove-Item -LiteralPath (Join-Path $ProfileDir $old.file) -Force -ErrorAction Stop } catch {} }
+    }
+}
 
 function Get-CfxPlayers {
     # Player count from the FiveM master list API. Returns [int] or $null on failure.
@@ -348,6 +413,13 @@ $dashHtml = @'
   .sev-crit{background:var(--st-critical)} .sev-warn{background:var(--st-warning);color:#0b0b0b}
   .sev-info{background:var(--muted)}
   .muted{color:var(--muted)}
+  a{color:var(--s-blue)}
+  .hint{font-size:11px;color:var(--muted);margin-top:8px;line-height:1.6}
+  .hint code{font-family:ui-monospace,Menlo,Consolas,monospace;background:var(--grid);
+             padding:1px 4px;border-radius:4px;color:var(--text-secondary)}
+  .btn{display:inline-block;padding:2px 9px;border:1px solid var(--border);border-radius:6px;
+       background:var(--page);color:var(--s-blue);font-size:11px;font-weight:600;text-decoration:none}
+  .btn:hover{border-color:var(--s-blue)}
 </style>
 </head>
 <body>
@@ -375,6 +447,13 @@ $dashHtml = @'
   <div class="card"><h2>Recent alerts</h2>
     <table><thead><tr><th>Time</th><th>Sev</th><th>Cause</th><th>Detail</th></tr></thead>
     <tbody id="alerts"><tr><td colspan="4" class="muted">none yet</td></tr></tbody></table>
+  </div>
+
+  <div class="card"><h2>Captured profiles</h2>
+    <table><thead><tr><th>Captured</th><th>Trigger</th><th>Size</th><th></th></tr></thead>
+    <tbody id="profiles"><tr><td colspan="4" class="muted">none yet</td></tr></tbody></table>
+    <div class="hint" id="profHint">Automatic profiler captures appear here. Turn them on with
+      <code>PROFILER_ENABLED=true</code> and <code>RCON_PASSWORD</code> in <code>sentinel.conf</code>.</div>
   </div>
 </div></div>
 <script>
@@ -419,6 +498,34 @@ function setChart(id, labels, seriesData){
   c.update('none');
 }
 function nn(v){ return (v==null || v<0) ? null : v; }
+// PowerShell's ConvertTo-Json collapses one-element arrays into bare objects.
+function arr(v){ return v == null ? [] : (Array.isArray(v) ? v : [v]); }
+
+const HINT_IDLE = 'Automatic profiler captures appear here. Turn them on with ' +
+  '<code>PROFILER_ENABLED=true</code> and <code>RCON_PASSWORD</code> in <code>sentinel.conf</code>.';
+const HINT_HAVE = 'Download a capture, then open it in Chrome: <b>F12</b> &rarr; <b>Performance</b> tab &rarr; ' +
+  'right-click the panel &rarr; <b>Load profile</b>. ' +
+  '<a href="https://ui.perfetto.dev" target="_blank" rel="noopener">ui.perfetto.dev</a> and ' +
+  '<code>chrome://tracing</code> read the same files. ' +
+  'The resource holding the longest block during the hitch is your culprit.';
+function renderProfiles(list){
+  const tb = document.getElementById('profiles');
+  if (!list.length){
+    tb.innerHTML = '<tr><td colspan="4" class="muted">none yet</td></tr>';
+    document.getElementById('profHint').innerHTML = HINT_IDLE;
+    return;
+  }
+  document.getElementById('profHint').innerHTML = HINT_HAVE;
+  tb.innerHTML = list.map(p=>{
+    const size = p.kb == null ? '' : (p.kb >= 1024 ? (p.kb/1024).toFixed(1)+' MB' : p.kb+' KB');
+    const cell = p.local
+      ? '<a class="btn" href="profiles/'+encodeURIComponent(p.file)+'" download>Download</a>'
+      : '<span class="muted" title="'+esc(p.file)+'">in the server folder</span>';
+    return '<tr><td class="mono">'+esc(p.ts)+'</td><td class="cause">'+esc(p.cause)+'</td>'+
+           '<td class="mono">'+esc(size)+'</td><td>'+cell+'</td></tr>';
+  }).join('');
+}
+
 let lastOk = 0;
 async function tick(){
   try{
@@ -431,13 +538,13 @@ async function tick(){
     set('tPlayers', now.players); set('tHttp', now.httpMs); set('tCore', now.cpuMax);
     set('tFxCpu', now.fxCpu); set('tRam', now.ramAvail); set('tUdp', now.udpIn); set('tPing', now.pingExt);
     document.getElementById('upd').textContent = now.ts || '-';
-    const h = d.hist || [];
+    const h = arr(d.hist);
     const L = h.map(x=>x.t);
     setChart('cPlayers', L, [h.map(x=>nn(x.p))]);
     setChart('cCpu', L, [h.map(x=>nn(x.cm)), h.map(x=>nn(x.ct)), h.map(x=>nn(x.fc))]);
     setChart('cUdp', L, [h.map(x=>nn(x.ui)), h.map(x=>nn(x.un))]);
     setChart('cPing', L, [h.map(x=>nn(x.p1)), h.map(x=>nn(x.p2))]);
-    const al = d.alerts || [];
+    const al = arr(d.alerts);
     document.getElementById('alerts').innerHTML = al.length === 0
       ? '<tr><td colspan="4" class="muted">none yet</td></tr>'
       : al.map(a=>{
@@ -445,6 +552,7 @@ async function tick(){
           return '<tr><td class="mono">'+esc(a.ts)+'</td><td><span class="pill '+cls+'">'+esc(a.severity)+'</span></td>'+
                  '<td class="cause">'+esc(a.cause)+'</td><td>'+esc(a.detail)+'</td></tr>';
         }).join('');
+    renderProfiles(arr(d.profiles));
   }catch(e){}
   document.getElementById('dot').className = 'dot' + ((Date.now()-lastOk) > 20000 ? ' stale' : '');
 }
@@ -468,9 +576,10 @@ if (-not $NoDashboard) {
         if (Test-Path $assetDash) { $dashHtml = [IO.File]::ReadAllText($assetDash) }
         if (-not $chartLibJs) { Write-Log "NOTE: chart.umd.min.js not found next to the script - dashboard charts will need CDN access." }
         $dash = [hashtable]::Synchronized(@{
-            json = '{"now":{},"hist":[],"alerts":[]}'
+            json = '{"now":{},"hist":[],"alerts":[],"profiles":[]}'
             html = $dashHtml
             chartjs = $chartLibJs
+            profileDir = $ProfileDir
         })
         $dashListener = New-Object System.Net.HttpListener
         $dashListener.Prefixes.Add("http://${DashboardBind}:${DashboardPort}/")
@@ -492,6 +601,18 @@ if (-not $NoDashboard) {
                     } elseif ($path -match 'chart\.js$') {
                         $bytes = [System.Text.Encoding]::UTF8.GetBytes([string]$dash.chartjs)
                         $ctx.Response.ContentType = 'text/javascript'
+                    } elseif ($path -match '/profiles/(sentinel_profile_[0-9_]+\.json)$') {
+                        # name pattern is fixed, so no path traversal is possible
+                        $f = Join-Path $dash.profileDir $Matches[1]
+                        if (Test-Path -LiteralPath $f) {
+                            $bytes = [IO.File]::ReadAllBytes($f)
+                            $ctx.Response.ContentType = 'application/json'
+                            $ctx.Response.Headers.Add('Content-Disposition', "attachment; filename=`"$($Matches[1])`"")
+                        } else {
+                            $ctx.Response.StatusCode = 404
+                            $bytes = [System.Text.Encoding]::UTF8.GetBytes('not found')
+                            $ctx.Response.ContentType = 'text/plain'
+                        }
                     } else {
                         $bytes = [System.Text.Encoding]::UTF8.GetBytes([string]$dash.html)
                         $ctx.Response.ContentType = 'text/html; charset=utf-8'
@@ -572,6 +693,7 @@ Write-Log "FiveM monitor started. Interval=${IntervalSec}s  Port=$ServerPort  Co
 if ($confPath) { Write-Log "Config: $confPath" }
 if ($ProfilerActive) {
     Write-Log "Auto-profiler: ON  ($ProfilerFrames frames, cooldown ${ProfilerCooldownSec}s, triggers: $($ProfilerTriggerSet -join ', '))"
+    Write-Log "Captures land in $ProfileDir and show up on the dashboard."
 } elseif ($ProfilerEnabled) {
     Write-Log "Auto-profiler: PROFILER_ENABLED=true but RCON_PASSWORD is empty - feature disabled (set rcon_password in server.cfg and sentinel.conf)"
 }
@@ -621,6 +743,7 @@ while ($true) {
     if ($fx) {
         $fxPid = $fx.Id; $fxRam = [int]($fx.WorkingSet64 / 1MB)
         $fxThreads = $fx.Threads.Count; $fxHandles = $fx.HandleCount
+        if (-not $script:fxExeDir) { try { $script:fxExeDir = Split-Path -Parent $fx.Path } catch {} }
         if ($prevFxPid -eq $fxPid -and $null -ne $prevFxCpuTime) {
             $deltaMs = ($fx.TotalProcessorTime - $prevFxCpuTime).TotalMilliseconds
             $fxCpu   = [math]::Round(100.0 * $deltaMs / ($IntervalSec * 1000) / $coreCount, 1)
@@ -838,6 +961,7 @@ while ($true) {
                      fxCpu=$fxCpu; ramAvail=$ramAvail; udpIn=$udpIn; pingExt=$pingExt }
             hist = @($dashHist.ToArray())
             alerts = $alertsArr
+            profiles = @($script:profileList.ToArray())
         }
         try { $dash.json = ($snap | ConvertTo-Json -Depth 5 -Compress) } catch {}
     }
@@ -854,9 +978,27 @@ while ($true) {
     if ($ProfilerActive -and $script:profilerSaveDue -and (Get-Date) -ge $script:profilerSaveDue) {
         $pf = 'sentinel_profile_{0}.json' -f (Get-Date -Format 'yyyyMMdd_HHmmss')
         if (Send-Rcon "profiler saveJSON $pf") {
-            Raise-Alert 'INFO' 'PROFILER_CAPTURED' ("Saved {0} in the server root folder (trigger: {1}). Open it in Chrome: F12 > Performance tab > right-click > Load profile (or chrome://tracing / ui.perfetto.dev)." -f $pf, $script:profilerCause) ([ref]$alerts)
+            $script:profilerCollect = @{ due = (Get-Date).AddSeconds(5); file = $pf; cause = $script:profilerCause }
         }
         $script:profilerSaveDue = $null
+    }
+
+    # ---- auto-profiler: pull the finished file into logs\profiles ----
+    if ($script:profilerCollect -and (Get-Date) -ge $script:profilerCollect.due) {
+        $pc  = $script:profilerCollect
+        $got = Collect-Profile $pc.file $pc.cause
+        if ($got.ok) {
+            Add-ProfileEntry @{ file = $pc.file; ts = (Get-Date -Format 'HH:mm:ss'); cause = $pc.cause
+                                kb = $got.kb; local = $true }
+            Raise-Alert 'INFO' 'PROFILER_CAPTURED' ("{0} ({1} KB, trigger: {2}) - download it from the dashboard's Captured profiles panel, or open {3} in Chrome: F12 > Performance > right-click > Load profile." -f `
+                $pc.file, $got.kb, $pc.cause, $got.path) ([ref]$alerts)
+        } else {
+            Add-ProfileEntry @{ file = $pc.file; ts = (Get-Date -Format 'HH:mm:ss'); cause = $pc.cause
+                                kb = $null; local = $false }
+            Raise-Alert 'INFO' 'PROFILER_CAPTURED' ("{0} saved by FXServer (trigger: {1}) but not found in the folders I checked - set SERVER_ROOT in sentinel.conf to the folder FXServer runs from and I'll collect the next one." -f `
+                $pc.file, $pc.cause) ([ref]$alerts)
+        }
+        $script:profilerCollect = $null
     }
 
     # ---- sleep the remainder of the interval ----

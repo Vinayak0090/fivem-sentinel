@@ -15,9 +15,14 @@
 
 # ---- automatic profiler capture ----
 # When one of the alerts listed in PROFILER_TRIGGERS fires, the monitor tells
-# FXServer over RCON to record a profile and saves it in the server data
-# directory as sentinel_profile_<timestamp>.json.
-# Open a capture from the server console with: profiler view <file>
+# FXServer over RCON to "profiler record" then "profiler saveJSON", saving
+# sentinel_profile_<timestamp>.json in the server root folder (where FXServer
+# runs). Open a saved capture in Chrome: press F12, go to the Performance tab,
+# right-click the panel and choose "Load profile" (or drag it into
+# chrome://tracing or ui.perfetto.dev). There is no console command to reopen
+# a saved file. To view live instead, run in the server console:
+#   profiler record 500
+#   profiler view          (opens the current in-memory recording)
 # Requires rcon_password to be set in your server.cfg (use the same value
 # here). Set PROFILER_ENABLED=true to turn the feature on.
 

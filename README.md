@@ -83,7 +83,11 @@ python3 tools/generate-report.py --date 2026-07-18
 
 ## Automatic profiler capture
 
-When the cause is a script, FiveM's built-in profiler is the tool that names the guilty resource — but by the time you type `profiler record` in the console, the hitch is over. fivem-sentinel can do it for you: the moment a trigger alert fires (a hitch, a stalling server thread, a saturated core, a mass drop), it tells FXServer over RCON to record a profile and saves it as `sentinel_profile_<timestamp>.json` in the server data directory. A `PROFILER_CAPTURED` alert with the filename lands in the alert log and dashboard, and you open the capture from the server console with `profiler view <file>`.
+When the cause is a script, FiveM's built-in profiler is the tool that names the guilty resource — but by the time you type `profiler record` in the console, the hitch is over. fivem-sentinel can do it for you: the moment a trigger alert fires (a hitch, a stalling server thread, a saturated core, a mass drop), it tells FXServer over RCON to `profiler record` and then `profiler saveJSON`, saving `sentinel_profile_<timestamp>.json` in the server root folder (where FXServer runs). A `PROFILER_CAPTURED` alert with the filename lands in the alert log and dashboard.
+
+To open a saved capture there is no console command — you load the JSON in Chrome: press `F12`, open the **Performance** tab, right-click the panel and choose **Load profile**, then pick the file (dragging it into `chrome://tracing` or [ui.perfetto.dev](https://ui.perfetto.dev) also works). The resource holding the longest block during the hitch is your culprit. If the capture came from a `MASS_PLAYER_DROP` but the timeline looks clean, that's itself a signal — the server thread was fine, so the drop came from outside the box: network or DDoS.
+
+To profile live instead of from a file, run `profiler record 500` then `profiler view` in the server console — `view` opens the current in-memory recording directly.
 
 Turn it on in `sentinel.conf`:
 
